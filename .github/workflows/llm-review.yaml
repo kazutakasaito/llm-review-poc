@@ -36,21 +36,18 @@ jobs:
       - name: Get changed markdown files
         id: changed_files
         run: |
-          # PRのベースブランチとヘッドブランチの間の差分ファイルを取得
-          # 対象は on.pull_request.paths で指定したパターンに合致する .md ファイル
-          # (より厳密には、ここで再度フィルタリングしても良い)
           files=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- '*.md' | grep -E '^(pbis/|user_stories/).*\.md$' || true)
           if [ -z "$files" ]; then
             echo "No markdown files changed in specified paths."
-            echo "changed_files_list=''" >> $GITHUB_OUTPUT
+            echo "changed_files_list=" >> $GITHUB_OUTPUT # 空の値を設定
           else
-            # ファイルパスをスペース区切りでリスト化
-            echo "changed_files_list<<EOF" >> $GITHUB_OUTPUT
-            echo "$files" | tr '\n' ' ' >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            echo "Changed markdown files: $files"
+            # 改行をスペースに変換し、末尾の不要なスペースを削除
+            processed_files=$(echo "$files" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            echo "changed_files_list=${processed_files}" >> $GITHUB_OUTPUT
+            echo "Changed markdown files listed in output: ${processed_files}"
           fi
-
+        shell: bash
+          
       - name: Run multi-persona review if files changed
         if: steps.changed_files.outputs.changed_files_list != ''
         env:
