@@ -66,7 +66,7 @@ jobs:
 
       - name: Format review results to Markdown
         id: format_review
-        if: steps.changed_files.outputs.changed_files_list != '' && hash review_results.json 2>/dev/null # review_results.jsonが存在する場合のみ
+        if: steps.changed_files.outputs.changed_files_list != ''
         shell: python
         run: |
           import json
