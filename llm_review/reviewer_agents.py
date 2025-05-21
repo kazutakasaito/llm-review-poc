@@ -1,14 +1,18 @@
 """
-Multi-persona LLM reviewer - stable JP version (2025-05) - v2
+Multi-persona LLM reviewer - stable JP version (2025-05) - v5
 --------------------------------------------------------
 エンジニア / PdM / アーキテクトが JSON 形式で指摘を返し、
 Supervisor がマージして review.json に出力します。
 複数のストーリーファイルを処理できるように改善。
+LLMが単一JSONオブジェクトを返した場合も配列として処理するように修正。
+プロンプトを調整し、より多くの指摘を促すように変更。
+LLMが "issues" キーでネストして返した場合も展開して処理するように修正。
 """
 
 import json
 import pathlib
 import sys
+import traceback # エラー詳細表示のため追加
 from langchain_openai import ChatOpenAI
 from langgraph.graph import MessageGraph, START, END
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -18,35 +22,35 @@ PERSONAS = {
     "engineer": dict(
         prompt=(
             "あなたは経験15年のシニアソフトウェアエンジニアです。\n"
-            "ユーザーストーリーを実装観点（依存関係・複雑度・DoR 達成状況など）でレビューしてください。\n"
-            "結果を必要なだけJSON 配列 [{severity, comment, line}] だけで返してください。\n"
+            "ユーザーストーリーを実装観点（例：依存関係、技術的実現性、複雑度、テスト容易性、DoR達成状況、潜在的なバグのリスクなど）で多角的にレビューしてください。\n"
+            "少なくとも3つの異なる具体的な指摘事項を挙げてください。より多くの指摘があれば、重要度順に含めてください。\n"
+            "結果は必ずJSON配列 [{severity, comment, line}, ...] の形式で返してください。指摘が1件の場合でも必ず配列で囲ってください。各指摘事項は、配列のトップレベルの要素として、直接 {severity, comment, line} のオブジェクトで表現してください。指摘事項をさらに別のキー（例: \"issues\"）でネストしないでください。\n"
             "severityは 'high', 'medium', 'low' のいずれかです。\n"
-            "lineは指摘箇所の行番号(整数)ですが、特定できない場合はnullにしてください。\n"
-            "（コメント件数に上限を設けず、重要度順にたくさん指摘して構いません）"
+            "lineは指摘箇所の行番号(整数)ですが、特定できない場合はnullにしてください。"
         ),
-        temperature=0,
+        temperature=0.0, # 安定した出力を求めるため低めに設定
     ),
     "pdm": dict(
         prompt=(
             "あなたはプロダクトマネージャーです。\n"
-            "ビジネス価値と KPI への紐づきの観点でレビューしてください。\n"
-            "結果を必要なだけJSON 配列 [{severity, comment, line}] だけで返してください。\n"
+            "ユーザーストーリーをプロダクト価値の観点（例：ビジネス目標への貢献、KPIへの影響、ユーザーストーリーの明確さ、受入基準の網羅性、市場適合性、競合との差別化など）で多角的にレビューしてください。\n"
+            "少なくとも3つの異なる具体的な指摘事項を挙げてください。より多くの指摘があれば、重要度順に含めてください。\n"
+            "結果は必ずJSON配列 [{severity, comment, line}, ...] の形式で返してください。指摘が1件の場合でも必ず配列で囲ってください。各指摘事項は、配列のトップレベルの要素として、直接 {severity, comment, line} のオブジェクトで表現してください。指摘事項をさらに別のキー（例: \"issues\"）でネストしないでください。\n"
             "severityは 'high', 'medium', 'low' のいずれかです。\n"
-            "lineは指摘箇所の行番号(整数)ですが、特定できない場合はnullにしてください。\n"
-            "（コメント件数に上限を設けず、重要度順にたくさん指摘して構いません）"
+            "lineは指摘箇所の行番号(整数)ですが、特定できない場合はnullにしてください。"
         ),
-        temperature=0.2,
+        temperature=0.3, # 多様な視点を得るため少し高めに設定
     ),
     "architect": dict(
         prompt=(
             "あなたはソフトウェアアーキテクトです。\n"
-            "非機能要件（性能・可用性・セキュリティなど）のリスクをレビューしてください。\n"
-            "結果を必要なだけJSON 配列 [{severity, comment, line}] だけで返してください。\n"
+            "ユーザーストーリーを非機能要件の観点（例：パフォーマンス、スケーラビリティ、セキュリティ、可用性、保守性、技術的負債、既存システムとの整合性など）で多角的にレビューしてください。\n"
+            "少なくとも3つの異なる具体的な指摘事項を挙げてください。より多くの指摘があれば、重要度順に含めてください。\n"
+            "結果は必ずJSON配列 [{severity, comment, line}, ...] の形式で返してください。指摘が1件の場合でも必ず配列で囲ってください。各指摘事項は、配列のトップレベルの要素として、直接 {severity, comment, line} のオブジェクトで表現してください。指摘事項をさらに別のキー（例: \"issues\"）でネストしないでください。\n"
             "severityは 'high', 'medium', 'low' のいずれかです。\n"
-            "lineは指摘箇所の行番号(整数)ですが、特定できない場合はnullにしてください。\n"
-            "（コメント件数に上限を設けず、重要度順にたくさん指摘して構いません）"
+            "lineは指摘箇所の行番号(整数)ですが、特定できない場合はnullにしてください。"
         ),
-        temperature=0,
+        temperature=0.0, # 安定した出力を求めるため低めに設定
     ),
 }
 
@@ -54,9 +58,9 @@ PERSONAS = {
 def make_llm(cfg):
     """LLMクライアントを生成します。JSONモードを有効にします。"""
     return ChatOpenAI(
-        model="gpt-3.5-turbo",  # or "gpt-3.5-turbo" for cost saving
+        model="gpt-4o-mini",
         temperature=cfg["temperature"],
-        max_tokens=1024,
+        max_tokens=1536,
         model_kwargs={"response_format": {"type": "json_object"}},
     )
 
@@ -65,82 +69,110 @@ def create_workflow():
     """レビューワークフローのグラフを構築します。"""
     graph_builder = MessageGraph()
 
-    # 各ペルソナのノードを定義
     for persona_name, config in PERSONAS.items():
         llm = make_llm(config)
         
-        def persona_node(messages, persona_name_node=persona_name, persona_prompt=config["prompt"]):
-            # messagesにはこれまでの会話履歴が入る。最後のメッセージが対象のストーリー。
-            if not messages:
-                # 通常はSTARTから呼ばれるのでここには来ない想定
-                return AIMessage(role=persona_name_node, content="[]")
+        def create_persona_node_func(p_name, p_config, p_llm):
+            def persona_node_func(messages):
+                if not messages:
+                    return AIMessage(role=p_name, content="[]")
 
-            # 最後のユーザーメッセージ（ストーリー本文）を取得
-            # HumanMessage以外にもSystemMessageでファイル名などを渡すことも検討可能
-            story_content = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage) and msg.role == "user_story_content":
-                    story_content = msg.content
-                    break
-            
-            if not story_content:
-                 # ストーリー内容が見つからない場合は空のJSON配列を返す
-                print(f"Warning: Story content not found for persona {persona_name_node}. Returning empty list.", file=sys.stderr)
-                return AIMessage(role=persona_name_node, content="[]")
+                story_content = ""
+                for msg in reversed(messages):
+                    if isinstance(msg, HumanMessage) and msg.role == "user_story_content":
+                        story_content = msg.content
+                        break
+                
+                if not story_content:
+                    print(f"Warning: Story content not found for persona {p_name}. Returning empty list.", file=sys.stderr)
+                    return AIMessage(role=p_name, content="[]")
 
-            # プロンプトを組み立て
-            # SystemMessageを使用して、より明確に役割と指示を与える
-            full_prompt_messages = [
-                SystemMessage(content=persona_prompt),
-                HumanMessage(content=f"--- 対象ストーリー ---\n{story_content}\n\n### 出力は指示されたJSONオブジェクトのみ ###")
-            ]
-            
-            try:
-                response = llm.invoke(full_prompt_messages)
-                # LLMからのレスポンスが空や不正なJSONでないか確認
-                if not response.content or not response.content.strip().startswith("["):
-                    print(f"Warning: Invalid JSON array from {persona_name_node}: {response.content}", file=sys.stderr)
-                    return AIMessage(role=persona_name_node, content="[]") # 空の配列を返す
-                # JSONとしてパースできるか念のため確認
+                full_prompt_messages = [
+                    SystemMessage(content=p_config["prompt"]),
+                    HumanMessage(content=f"--- 対象ストーリー ---\n{story_content}\n\n### 出力は指示されたJSONオブジェクトのみ ###")
+                ]
+                
+                print(f"\n--- Sending to LLM for persona: {p_name} ---", file=sys.stderr)
+                processed_content = "[]"
                 try:
-                    json.loads(response.content)
-                except json.JSONDecodeError:
-                    print(f"Warning: Failed to parse JSON from {persona_name_node}: {response.content}", file=sys.stderr)
-                    return AIMessage(role=persona_name_node, content="[]") # 空の配列を返す
-                return AIMessage(role=persona_name_node, content=response.content)
-            except Exception as e:
-                print(f"Error invoking LLM for {persona_name_node}: {e}", file=sys.stderr)
-                return AIMessage(role=persona_name_node, content="[]") # エラー時も空の配列
+                    response = p_llm.invoke(full_prompt_messages)
+                    print(f"--- Raw LLM response for {p_name}: ---", file=sys.stderr)
+                    print(response.content, file=sys.stderr)
+                    print(f"--- End of raw LLM response for {p_name} ---", file=sys.stderr)
 
-        graph_builder.add_node(persona_name, persona_node)
-        graph_builder.add_edge(START, persona_name) # STARTから各ペルソナへ
-        graph_builder.add_edge(persona_name, "merge_reviews") # 各ペルソナからマージノードへ
+                    if response.content and response.content.strip():
+                        content_strip = response.content.strip()
+                        if content_strip.startswith("[") and content_strip.endswith("]"):
+                            try:
+                                json.loads(content_strip)
+                                processed_content = content_strip
+                            except json.JSONDecodeError as e_parse_array:
+                                print(f"Warning: Failed to parse JSON array from {p_name}. Error: {e_parse_array}. Response was: '{response.content}'", file=sys.stderr)
+                        elif content_strip.startswith("{") and content_strip.endswith("}"):
+                            print(f"Info: LLM returned a single JSON object for {p_name}. Wrapping in an array. Response was: '{response.content}'", file=sys.stderr)
+                            try:
+                                json.loads(content_strip)
+                                processed_content = f"[{content_strip}]"
+                            except json.JSONDecodeError as e_parse_object:
+                                print(f"Warning: Failed to parse single JSON object from {p_name}. Error: {e_parse_object}. Response was: '{response.content}'", file=sys.stderr)
+                        else:
+                            print(f"Warning: Invalid JSON structure from {p_name}. Does not start with '[' or '{{'. Response was: '{response.content}'", file=sys.stderr)
+                    else:
+                        print(f"Warning: Empty response content from {p_name}.", file=sys.stderr)
+                    
+                    return AIMessage(role=p_name, content=processed_content)
 
-    # レビュー結果をマージするノード
+                except Exception as e_invoke:
+                    print(f"Error invoking LLM for {p_name}: {e_invoke}", file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
+                    return AIMessage(role=p_name, content="[]")
+
+            return persona_node_func
+
+        node_func = create_persona_node_func(persona_name, config, llm)
+        graph_builder.add_node(persona_name, node_func)
+        graph_builder.add_edge(START, persona_name)
+        graph_builder.add_edge(persona_name, "merge_reviews")
+
     def merge_node(messages):
         merged_reviews = {}
-        # AIMessageで、かつroleがペルソナ名であるものを収集
         for msg in messages:
             if isinstance(msg, AIMessage) and msg.role in PERSONAS:
                 try:
-                    # contentがJSON配列文字列であることを期待
-                    persona_review_list = json.loads(msg.content)
-                    merged_reviews[msg.role] = persona_review_list
+                    # LLMから返ってきたJSON文字列をパース
+                    raw_reviews_from_persona = json.loads(msg.content)
+                    
+                    final_review_list = []
+                    if isinstance(raw_reviews_from_persona, list):
+                        for item in raw_reviews_from_persona:
+                            # itemが {"issues": [{sev, com, line}, ...]} のような構造かチェック
+                            if isinstance(item, dict) and "issues" in item and isinstance(item["issues"], list):
+                                print(f"Info: Unpacking 'issues' array for persona {msg.role}", file=sys.stderr)
+                                final_review_list.extend(item["issues"]) # "issues" の中身 (指摘事項のリスト) を展開
+                            # itemが直接 {sev, com, line} の構造かチェック
+                            elif isinstance(item, dict) and all(k in item for k in ("severity", "comment")):
+                                final_review_list.append(item)
+                            else:
+                                # 予期しない形式のアイテム
+                                print(f"Warning: Skipping unexpected item structure in review list for {msg.role}: {item}", file=sys.stderr)
+                    else:
+                        # そもそもリスト形式ではなかった場合
+                        print(f"Warning: Expected a list of reviews from {msg.role}, but got {type(raw_reviews_from_persona)}. Content: {msg.content}", file=sys.stderr)
+                        final_review_list = [{"severity": "error", "comment": f"Unexpected review format from {msg.role}.", "line": None}]
+                    
+                    merged_reviews[msg.role] = final_review_list
+
                 except json.JSONDecodeError:
-                    print(f"Warning: Could not decode JSON from {msg.role}: {msg.content}", file=sys.stderr)
-                    merged_reviews[msg.role] = [{"severity": "error", "comment": f"Failed to parse review from {msg.role}.", "line": None}]
+                    print(f"Warning: Could not decode JSON in merge_node from {msg.role}: {msg.content}", file=sys.stderr)
+                    merged_reviews[msg.role] = [{"severity": "error", "comment": f"Failed to parse review from {msg.role} in merge_node.", "line": None}]
                 except Exception as e:
-                    print(f"Error processing message from {msg.role}: {e}", file=sys.stderr)
-                    merged_reviews[msg.role] = [{"severity": "error", "comment": f"Unexpected error processing review from {msg.role}.", "line": None}]
+                    print(f"Error processing message in merge_node from {msg.role}: {e}", file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
+                    merged_reviews[msg.role] = [{"severity": "error", "comment": f"Unexpected error processing review from {msg.role} in merge_node.", "line": None}]
 
-
-        # 最終的な出力をHumanMessageやSystemMessageではなく、AIMessage(role="supervisor") などでラップして返す
-        # ここでは、直接JSON文字列を返すのではなく、次のステップで処理しやすいようにPythonのdictとして返す
-        # ただし、LangGraphのMessageGraphはMessageオブジェクトを期待するため、AIMessageでラップする
         return AIMessage(role="supervisor", content=json.dumps(merged_reviews, ensure_ascii=False))
 
     graph_builder.add_node("merge_reviews", merge_node)
-    # 'merge_reviews' の後に END を設定
     graph_builder.add_edge("merge_reviews", END)
     
     return graph_builder.compile()
@@ -178,18 +210,13 @@ def main():
             })
             continue
         
-        # ワークフローに渡す初期メッセージ。HumanMessageのroleを工夫してファイル内容であることを示す
-        # LangGraphでは通常、リスト形式でメッセージを渡す
         initial_message = [HumanMessage(content=story_text, role="user_story_content")]
         
         print(f"Reviewing {story_file_path_str}...", file=sys.stderr)
         
-        # ワークフローを実行
-        # invokeの戻り値は、グラフ内の各ノードが返したMessageオブジェクトのリスト
         final_state_messages = workflow.invoke(initial_message)
         
-        # 最後のメッセージ（merge_reviewsノードからの出力）を取得
-        merged_review_content = "{}" # デフォルトは空のJSONオブジェクト文字列
+        merged_review_content = "{}" 
         for msg in reversed(final_state_messages):
             if isinstance(msg, AIMessage) and msg.role == "supervisor":
                 merged_review_content = msg.content
@@ -210,7 +237,6 @@ def main():
                 "review": {}
             })
 
-    # 全てのファイルの結果をJSONとして標準出力に出力
     print(json.dumps(all_results, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
